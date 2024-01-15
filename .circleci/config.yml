@@ -1,0 +1,401 @@
+version: 2.1
+
+executors:
+  develop_executor:
+    parameters:
+      service_name:
+        description: "Name of this service "
+        default: "rb_taxonomy"
+        type: string
+    docker:
+      - image: us-docker.pkg.dev/images-4a3fb6/gcr.io/helm-charts-ci:0.0.7
+        auth:
+          username: _json_key
+          password: $SERVICE_ACCOUNT_KEY
+    environment:
+      # you've got to set it below (~ 178ish) to get it to count.
+      POD_MIN_COUNT: "1"
+      POD_MAX_COUNT: "1"
+      ENVIRONMENT_NAME: "develop"
+      SERVICE_NAME: "<<parameters.service_name>>"
+      SENTRY_TRACES_SAMPLE_RATE: "0.0001"
+      SENTRY_ERROR_SAMPLE_RATE: "1"
+      LOG_LEVEL: "DEBUG"
+      CLUSTER_NAME: "services-dev"
+      GCP_PROJECT: "services-dev-525bf6"
+      STATIC_FILES_BUCKET: "services-dev-525bf6-valuation-service"
+      TLS_SECRET_NAME: "develop-rouseservices-com"
+      ALLOWED_HOSTS: "localhost,.platform-valuation,.rouseservices.com"
+#      VALUES_MODEL_GC_BUCKET_NAME: "appraisals-data-dev-c55fa4-appraisal-valuation-etl-n"
+#      APP_HOSTNAME: "valuation-service.develop.rouseservices.com"
+      HONEYCOMB_DATASET: "<<parameters.service_name>>-valuation-service-dev"
+      HONEYCOMB_SAMPLE_RATE: "10000" # 1 in 10,000, 0.05%
+      HONEYCOMB_SERVICE: "<<parameters.service_name>>-valuation-service"
+      GCPROFILER_SERVICE_NAME: "<<parameters.service_name>>-valuation-service"
+
+      # Feature toggles
+      ENABLE_GOOGLE_CLOUD_PROFILER: "False"
+      ENABLE_GOOGLE_CLOUD_DEBUGGER: "False"
+#      REDIS_HOST: "services-kubernetes-dev-network"
+      REDIS_HOST: "10.127.0.67"
+
+    working_directory: ~/repo
+
+  prod_executor:
+    parameters:
+      service_name:
+        description: "Name of this service"
+        default: "rb_taxonomy"
+        type: string
+    docker:
+      - image: us-docker.pkg.dev/images-4a3fb6/gcr.io/helm-charts-ci:0.0.7
+        auth:
+          username: _json_key
+          password: $SERVICE_ACCOUNT_KEY
+    environment:
+      POD_MIN_COUNT: "1"
+      POD_MAX_COUNT: "1"
+      AUTH0_DOMAIN: "rouse-prod.auth0.com"
+      AUTH0_ISSUER_DOMAIN: "login.rouseservices.com"
+      ENVIRONMENT_NAME: "prod"
+      SERVICE_NAME: "<<parameters.service_name>>"
+      LOG_LEVEL: "INFO"
+      CLUSTER_NAME: "services-prod"
+      GCP_PROJECT: "services-prod-e6fffc"
+      STATIC_FILES_BUCKET: "services-prod-e6fffc-valuation-service"
+      TLS_SECRET_NAME: "rouseservices-com-tls"
+      ALLOWED_HOSTS: "localhost,.platform-valuation,.rouseservices.com"
+#      VALUES_MODEL_GC_BUCKET_NAME: "appraisals-data-prod-707493-appraisal-valuation-etl-n"
+#      ML4R_GC_BUCKET_NAME: "appraisals-data-prod-707493-ml-for-rouse-etl"
+#      APP_HOSTNAME: "valuation-service.rouseservices.com"
+      GCPROFILER_SERVICE_NAME: "<<parameters.service_name>>-valuation-service"
+      HONEYCOMB_DATASET: "<<parameters.service_name>>-valuation-service-prod"
+      HONEYCOMB_SAMPLE_RATE: "10000" # 1 in 2000, 0.05%
+      HONEYCOMB_SERVICE: "<<parameters.service_name>>-valuation-service"
+      # Feature toggles
+      ENABLE_GOOGLE_CLOUD_PROFILER: "False"
+      ENABLE_GOOGLE_CLOUD_DEBUGGER: "False"
+
+      SENTRY_TRACES_SAMPLE_RATE: "0.001"
+      SENTRY_ERROR_SAMPLE_RATE: "1"
+#      REDIS_HOST: "services-kubernetes-prod-network"
+      REDIS_HOST: "10.127.0.76"
+
+    working_directory: ~/repo
+commands:
+
+  execute-tests:
+    steps:
+      - checkout
+      - run:
+          name: Validates preconditions and executes Pytest
+          command: |
+            echo "Executing Pytest"
+            export DEPLOY_DATETIME=`date '+%Y-%m-%d %H:%M'`
+            echo "$DEPLOY_DATETIME"
+            mkdir pytest-logs
+            chmod 777 pytest-logs
+            echo "Starting compose build"
+            docker-compose build --build-arg PYPI_USER="$PYPI_USER" --build-arg PYPI_PASSWORD="$PYPI_PASSWORD" --build-arg DEPLOY_DATETIME="$DEPLOY_DATETIME"
+            echo "Running tests"
+            docker-compose run app pytest -m "not integrationtest" --junitxml="pytest-logs/pytest-results.xml"
+      - store_test_results:
+          path: "pytest-logs"
+
+  build-deploy:
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: docker build
+          command: |
+            DOCKER_REGISTRY=us-docker.pkg.dev
+            GCR_REGISTRY="${DOCKER_REGISTRY}/${GCP_PROJECT}/gcr.io"
+            echo $SERVICE_ACCOUNT_KEY > ${HOME}/gcloud_auth.json
+            gcloud auth activate-service-account --key-file=${HOME}/gcloud_auth.json
+            set -x
+            gcloud --quiet config set project ${GCP_PROJECT}
+            gcloud auth configure-docker --quiet $DOCKER_REGISTRY
+            gcloud debug source gen-repo-info-file
+
+            VERSION="1.0.$CIRCLE_BUILD_NUM"
+            REPO_NAME="platform-valuation-service"
+            docker pull ${GCR_REGISTRY}/${REPO_NAME}:latest || true
+            docker pull ${GCR_REGISTRY}/${REPO_NAME}:builder || true
+            docker build --target builder --cache-from=${GCR_REGISTRY}/${REPO_NAME}:builder \
+                        --tag ${GCR_REGISTRY}/${REPO_NAME}:builder \
+                        --build-arg PYPI_PASSWORD \
+                        --build-arg PYPI_USER \
+                        .
+            docker build --target app --cache-from=${GCR_REGISTRY}/${REPO_NAME}:builder \
+                        --cache-from=${GCR_REGISTRY}/${REPO_NAME}:latest \
+                        --tag ${REPO_NAME} \
+                        --build-arg PYPI_PASSWORD \
+                        --build-arg PYPI_USER \
+                        .
+            docker tag ${REPO_NAME} ${GCR_REGISTRY}/${REPO_NAME}:$VERSION
+            docker tag ${REPO_NAME} ${GCR_REGISTRY}/${REPO_NAME}:latest
+            docker push ${GCR_REGISTRY}/${REPO_NAME}:builder
+            docker push ${GCR_REGISTRY}/${REPO_NAME}:$VERSION
+            docker push ${GCR_REGISTRY}/${REPO_NAME}:latest
+      - run:
+          name: deploy
+          command: |
+            chmod +x deploy/ci*.sh
+            export VERSION="1.0.$CIRCLE_BUILD_NUM"
+            export POD_MIN_COUNT
+            export POD_MAX_COUNT
+            export GCP_PROJECT
+            export RELEASE_NAME="${ENVIRONMENT_NAME,,}-app"
+            export ENVIRONMENT_NAME
+            export HONEYCOMB_DATASET
+            export HONEYCOMB_SAMPLE_RATE
+            export HONEYCOMB_SERVICE
+            export LOG_LEVEL
+            export CACHE_KEY_PREFIX="${ENVIRONMENT_NAME,,}-${VERSION}"
+            export APP_DOMAIN
+            export TLS_SECRET_NAME
+            export VALUES_MODEL_GC_BUCKET_NAME
+            export GCPROFILER_SERVICE_NAME
+            export ENABLE_GOOGLE_CLOUD_PROFILER
+            export ENABLE_GOOGLE_CLOUD_DEBUGGER
+
+            export REDIS_HOST
+
+            set -x
+            
+            AUTOSCALING_ENABLED="true"
+
+            if [ $ENVIRONMENT_NAME = "prod" ]; then
+                ########################################
+                # the PROD environment 
+                ########################################
+            
+                MEMORY_REQUESTED=.5Gi
+                CPUS_REQUESTED=.25
+                GPUS_REQUESTED=0
+                EPHEMERAL_STORAGE=55Gi
+                ALGO_VALUATION_URL="valuation-algo-service.rouseservices.com"
+                if [ "${SERVICE_NAME}" = "platform" ]; then
+                    POD_MIN_COUNT=1
+                    POD_MAX_COUNT=3
+                    MODEL_GROUP="alpha"
+                fi
+
+            elif [ $ENVIRONMENT_NAME = "develop" ]; then
+           
+                MEMORY_REQUESTED=.4Gi
+                CPUS_REQUESTED=.1
+                GPUS_REQUESTED=0
+                EPHEMERAL_STORAGE=55Gi
+                ########################################
+                # the DEVELOP environment for internal users
+                ########################################
+                if [ "${SERVICE_NAME}" = "platform" ]; then
+                    POD_MIN_COUNT=8
+                    POD_MAX_COUNT=12
+                    PROCESS_COUNT=2
+                    MODEL_GROUP="alpha"
+                
+                ########################################
+                # the STAGE environment we use to gather features for the next release
+                ########################################
+                elif [ "${SERVICE_NAME}" = "stage" ]; then
+                    # we only need one release to merge commits 
+                    POD_MIN_COUNT=2
+                    POD_MAX_COUNT=3
+                    PROCESS_COUNT=2
+                    RELEASE_NAME="${SERVICE_NAME}-${RELEASE_NAME}"
+                    APP_HOSTNAME="${SERVICE_NAME}-${APP_HOSTNAME}"
+                    MODEL_GROUP="alpha"
+                    ENVIRONMENT_NAME="stage"
+                    MEMORY_REQUESTED=.2Gi
+                    CPUS_REQUESTED=.2
+           
+          
+                ########################################
+                # the BETA environment we use internal client development
+                ########################################
+                elif [ "${SERVICE_NAME}" = "beta" ]; then
+                
+                    POD_MIN_COUNT=0
+                    POD_MAX_COUNT=2
+                    PROCESS_COUNT=2
+                    RELEASE_NAME="${SERVICE_NAME}-${RELEASE_NAME}"
+                    APP_HOSTNAME="${SERVICE_NAME}-${APP_HOSTNAME}"
+                    ALGO_VALUATION_URL="beta-valuation-algo-service.develop.rouseservices.com"
+                    USAGE_MIN_USAGE="10.0"
+                    USAGE_AGE_MIN_CHECK="1.0"
+                    USAGE_FLOOR_VALUE="0.0"
+                    USAGE_CEILING_VALUE="6.0"
+                    USAGE_MIN_FACTOR="0.65"
+                    USAGE_MAX_FACTOR="1.30"
+                    USAGE_FACTOR_STRATEGY="2"
+                    MEMORY_REQUESTED=.2Gi
+                    CPUS_REQUESTED=.2
+            
+                ########################################
+                # GAMMA is BILLY's environment. don't touch! 
+                ########################################
+                elif [ "${SERVICE_NAME}" = "gamma" ]; then
+              
+                    ## GAMMA only deploys FM 
+                    
+                    POD_MIN_COUNT=0
+                    POD_MAX_COUNT=2
+                    PROCESS_COUNT=2
+                    RELEASE_NAME="${SERVICE_NAME}-${RELEASE_NAME}"
+                    APP_HOSTNAME="${SERVICE_NAME}-${APP_HOSTNAME}"
+                    MEMORY_REQUESTED=.15Gi
+                    CPUS_REQUESTED=.1
+                ########################################
+                # LAMBDA is Darren's environment. please don't touch! 
+                ########################################
+                elif [ "${SERVICE_NAME}" = "lambda" ]; then
+              
+                    ## GAMMA only deploys FM 
+                    
+                    POD_MIN_COUNT=0
+                    POD_MAX_COUNT=2
+                    PROCESS_COUNT=2
+                    RELEASE_NAME="${SERVICE_NAME}-${RELEASE_NAME}"
+                    APP_HOSTNAME="${SERVICE_NAME}-${APP_HOSTNAME}"
+                    MEMORY_REQUESTED=.15Gi
+                    CPUS_REQUESTED=.1
+
+                fi
+            fi  
+            
+            export POD_MIN_COUNT
+            export POD_MAX_COUNT
+            export PROCESS_COUNT
+            export API_THREAD_COUNT
+            
+            export MEMORY_REQUESTED
+            export CPUS_REQUESTED
+            export RELEASE_NAME
+            export APP_HOSTNAME
+
+            gcloud auth activate-service-account --key-file=${HOME}/gcloud_auth.json
+            export GOOGLE_APPLICATION_CREDENTIALS=${HOME}/gcloud_auth.json
+            gcloud --quiet config set project ${GCP_PROJECT}
+            gcloud container clusters get-credentials ${CLUSTER_NAME} --zone us-central1-b
+            cd deploy/
+            NAMESPACE=platform-valuation
+            export AUTOSCALING_ENABLED
+            export NEG_ENABLED="true"
+            export INGRESS_ENABLED="true"
+            export ALGO_ENABLED_BY_DEFAULT="True"
+            export ALGOLIA_ID
+            export ALGOLIA_KEY
+            export DEPLOY_DATETIME=`date '+%Y-%m-%d %H:%M'`
+            export MODEL_GROUP
+            export SERVICE_NAME
+            helmfile apply
+
+            
+
+          no_output_timeout: 45m
+jobs:
+  test:
+    machine:
+      image: ubuntu-2004:202010-01
+    steps:
+      - execute-tests
+
+  profile_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "profile"
+
+  beta_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "beta"
+
+  gamma_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "gamma"
+
+  lambda_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "lambda"
+
+  release_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "release"
+
+  stage_build_deploy:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "stage"
+
+  develop_build_deploy_platform:
+    steps:
+      - build-deploy
+    executor:
+      name: develop_executor
+      service_name: "platform"
+
+  prod_build_deploy_platform:
+    steps:
+      - build-deploy
+    executor:
+      name: prod_executor
+      service_name: "platform"
+
+workflows:
+  version: 2
+  build-test-and-deploy-api:
+    jobs:
+      - test
+      - gamma_build_deploy:
+          filters:
+            branches:
+              only: /env-gamma\/.*/
+
+      - beta_build_deploy:
+          filters:
+            branches:
+              only: /env-beta\/.*/
+
+      - lambda_build_deploy:
+          filters:
+            branches:
+              only: /env-lambda\/.*/
+
+      - profile_build_deploy:
+          filters:
+            branches:
+              only: /env-profiling\/.*/
+
+      - stage_build_deploy:
+          filters:
+            branches:
+              only: /env-stage\/.*/
+
+      - develop_build_deploy_platform:
+          filters:
+            branches:
+              only: /env-develop\/latest/
+
+      - prod_build_deploy_platform:
+          filters:
+            branches:
+              only: main

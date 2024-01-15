@@ -1,0 +1,295 @@
+environments:
+  default:
+    values:
+      - app_version: {{ env "VERSION" | default "0.0.2" }}
+        auth0_domain: {{env "AUTH0_DOMAIN" | default "rouse-dev.auth0.com"}}
+        auth0_issuer_domain: {{env "AUTH0_ISSUER_DOMAIN" | default "dev-login.rouseservices.com"}}
+        pod_min_count: {{ env "POD_MIN_COUNT" | default "1" }}
+        pod_max_count: {{ env "POD_MAX_COUNT" | default "3" }}
+        processes_count: {{ env "PROCESSES_COUNT" | default "1" }}
+        thread_count: {{ env "API_THREAD_COUNT" | default "24" }}
+        environment_name: {{ env "ENVIRONMENT_NAME" | default "dev" }}
+        honeycomb_dataset: {{ env "HONEYCOMB_DATASET" | default "platform-valuation-service-dev" }}
+        honeycomb_sample_rate: {{ env "HONEYCOMB_SAMPLE_RATE" | default "100" }}
+        honeycomb_service: {{ env "HONEYCOMB_SERVICE" | default "platform-valuation-service" }}
+        sentry_traces_sample_rate: {{ env "SENTRY_TRACES_SAMPLE_RATE" | default "1.0" | quote }}
+        release_name: {{ env "RELEASE_NAME" | default "develop" }}
+        gcp_project: {{ env "GCP_PROJECT" | default "services-dev-525bf6" }}
+        update_strategy: {{ env "UPDATE_STRATEGY" | default "RollingUpdate" }}
+        static_files_bucket: {{ env "STATIC_FILES_BUCKET" | default "services-dev-525bf6-valuation-service" }}
+        cpus_requested: {{env "CPUS_REQUESTED" | default ".5"}}
+        gpus_requested: {{env "GPUS_REQUESTED" | default "0"}}
+        ephemeral_storage: {{env "EPHEMERAL_STORAGE" | default "55Gi"}}
+        app_hostname: {{ env "APP_HOSTNAME" | default "localhost" }}
+        allowed_hosts: {{ env "ALLOWED_HOSTS" | default "localhost" }}
+        neg_enabled: {{ env "NEG_ENABLED" | default "true" }}
+        memory_requested: {{env "MEMORY_REQUESTED" | default "4Gi"}}
+        autoscaling_enabled: {{ env "AUTOSCALING_ENABLED" | default "true" }}
+        ingress_enabled: {{ env "INGRESS_ENABLED" | default "true" }}
+        tls_secret_name: {{env "TLS_SECRET_NAME" | default "develop-rouseservices-com"}}
+        data_bucket: {{env "VALUES_MODEL_GC_BUCKET_NAME" | default "appraisals-data-prod-707493-appraisal-valuation-etl-n"}}
+        gcprofiler_service_name: {{env "GCPROFILER_SERVICE_NAME" | default "default"}}
+        enable_google_cloud_profiler: {{env "ENABLE_GOOGLE_CLOUD_PROFILER" | default "False"}}
+        enable_google_cloud_debugger: {{env "ENABLE_GOOGLE_CLOUD_DEBUGGER" | default "False"}}
+        termination_grace_period_seconds: {{env "TERMINATION_GRACE_PERIOD_SECONDS" | default "360"}}
+        redis_host: {{ env "REDIS_HOST" | default "redis-cache-master" }}
+        redis_port: {{ env "REDIS_PORT" | default "6379" }}
+        redis_password: {{ env "REDIS_PASSWORD" | default "" | quote }}
+        algolia_id: {{ env "ALGOLIA_ID" | default ""}}
+        algolia_key: {{ env "ALGOLIA_KEY" | default ""}}
+        service_name: {{ env "SERVICE_NAME" | default "" }}
+
+repositories:
+  - name: rouse-charts
+    url: gs://images-4a3fb6-helm-charts/
+
+releases:
+  - name: "{{ .Values.release_name }}"
+    namespace: platform-valuation
+    labels:
+      name: web
+      type: web
+    chart: rouse-charts/web-application  #../../helm-charts/charts/web-application
+    version: ~3.5.0
+    wait: true
+    timeout: 1800
+    values:
+      - volumeMounts:
+         - name: data-volume
+           mountPath: /home/appuser/app/valuation_models
+      - volumes:
+          - name: data-volume
+            emptyDir: {}
+      - containerPort: 5000
+      - initContainers:
+          - name: get-data
+            image: google/cloud-sdk:303.0.0-slim
+            command: ['gsutil', '-m', 'rsync', '-r', 'gs://{{ .Values.data_bucket }}/published/{{ .Values.model_group }}', '/mnt/valuation_models']
+            volumeMounts:
+              - mountPath: /mnt/valuation_models
+                name: data-volume
+          - name: get-data-in-progress
+            image: google/cloud-sdk:303.0.0-slim
+            command: [ 'gsutil', '-m', 'rsync', '-r', 'gs://{{ .Values.data_bucket }}/published/alpha', '/mnt/valuation_models/' ]
+            volumeMounts:
+              - mountPath: /mnt/valuation_models
+                name: data-volume
+          - name: get-ml4r
+            image: google/cloud-sdk:303.0.0-slim
+            command: [ 'gsutil', '-m', 'rsync', '-r', 'gs://{{ .Values.ml4r_bucket }}/published/{{ .Values.model_group }}', '/mnt/valuation_models/ml4r/' ]
+            volumeMounts:
+              - mountPath: /mnt/valuation_models
+                name: data-volume
+          - name: change-permissions
+            image: google/cloud-sdk:303.0.0-slim
+            command: ['chmod', 'a+w', '-R', '/mnt/valuation_models']
+            volumeMounts:
+              - mountPath: /mnt/valuation_models
+                name: data-volume
+          - name: decompress-data
+            image: google/cloud-sdk:303.0.0-slim
+            command: [ "gunzip", "-r", "-f", "/mnt/valuation_models" ]
+            volumeMounts:
+              - mountPath: /mnt/valuation_models
+                name: data-volume
+
+
+        service:
+          type: NodePort
+          port: 80
+          targetPort: 5000
+
+        livenessProbe:
+          httpGet:
+            path: /hz
+            port: 5000
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 10
+          failureThreshold: 4
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 5000
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 5
+          failureThreshold: 2
+
+        resources:
+          requests:
+            cpu: {{.Values.cpus_requested}}
+            memory: {{.Values.memory_requested}}
+            ephemeral-storage:  {{.Values.ephemeral_storage}}
+
+        nodeSelector:
+          auth-type: workload-identity
+          purpose: platform-valuation
+          scheduling.cast.ai/storage-optimized: "true"
+
+        tolerations:
+          - key: application
+            operator: "Equal"
+            value: "web"
+            effect: "NoSchedule"
+          - key: workload-identity
+            operator: "Equal"
+            value: "enabled"
+            effect: "NoSchedule"
+          - key: platform-valuation
+            operator: "Equal"
+            value: "reserved"
+            effect: "NoSchedule"
+          - key: scheduling.cast.ai/storage-optimized
+            operator: Exists
+
+        serviceAccountName: platform-valuation
+
+        neg:
+          enabled: {{ .Values.neg_enabled }}
+          value: '{"exposed_ports": {"80":{}}}'
+
+        autoscaling:
+          enabled: {{ .Values.autoscaling_enabled }}
+          minReplicas: {{ .Values.pod_min_count }}
+          maxReplicas: {{ .Values.pod_max_count }}
+          targetCPUUtilizationPercentage: 60
+
+        ingress:
+          enabled: {{ .Values.ingress_enabled }}
+          annotations:
+            kubernetes.io/ingress.class: "gce-internal"
+            kubernetes.io/ingress.allow-http: "false"
+          hosts:
+            - host: {{ .Values.app_hostname }}
+              paths:
+                - path: /*
+          tls:
+            - secretName: {{ .Values.tls_secret_name }}
+
+        backendConfig:
+          enabled: true
+          timeoutSec: 300
+
+        appVersion: {{ .Values.app_version }}
+        updateStrategy:
+          type: {{ .Values.update_strategy }}
+
+        image:
+          repository: us-docker.pkg.dev/{{ .Values.gcp_project }}/gcr.io/platform-valuation-service
+        command: [
+          "gunicorn", "valuation_service.wsgi:application",
+          "-b", "0.0.0.0:5000",
+          "-w", "{{ .Values.processes_count }}",
+          "-c", "python:rouse_observability_tools_services.django.gunicorn_conf",
+          "--capture-output",
+          "--enable-stdio-inheritance",
+          "--threads", "{{ .Values.thread_count }}",
+          "--access-logfile", "-",
+          "--log-level", "info",
+          "--timeout", "300",
+          "--keep-alive", "620"
+        ]
+        terminationGracePeriodSeconds: {{ .Values.termination_grace_period_seconds }}
+        replicaCount: {{ .Values.pod_min_count }}
+        env:
+          - name: SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: secrets
+                key: secret_key
+          - name: THIS_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: ALLOWED_HOSTS
+            value: '{{ .Values.allowed_hosts }}'
+          - name: AUTH0_DOMAIN
+            value: {{.Values.auth0_domain}}
+          - name: AUTH0_ISSUER_DOMAIN
+            value: {{.Values.auth0_issuer_domain}}
+          - name: ENVIRONMENT_NAME
+            value: {{ .Values.environment_name }}
+          - name: HONEYCOMB_DATASET
+            value: {{ .Values.honeycomb_dataset }}
+          - name: HONEYCOMB_SAMPLE_RATE
+            value: {{ .Values.honeycomb_sample_rate | quote }}
+          - name: HONEYCOMB_SERVICE
+            value: {{ .Values.honeycomb_service }}
+          - name: STATIC_FILES_BUCKET
+            value: {{ .Values.static_files_bucket }}
+          - name: HONEYCOMB_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: honeycomb-api-key
+                key: key
+          - name: SENTRY_TRACES_SAMPLE_RATE
+            value: {{ .Values.sentry_traces_sample_rate | quote }}
+          - name: SENTRY_INTEGRATION_DSN
+            valueFrom:
+              secretKeyRef:
+                name: secrets
+                key: sentry_dsn
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          - name: GCPROFILER_SERVICE_NAME
+            value: {{ .Values.gcprofiler_service_name }}
+          - name: ENABLE_GOOGLE_CLOUD_PROFILER
+            value: {{ .Values.enable_google_cloud_profiler | quote }}
+          - name: ENABLE_GOOGLE_CLOUD_DEBUGGER
+            value: {{ .Values.enable_google_cloud_debugger | quote }}
+          - name: REDIS_HOST
+            value: {{ .Values.redis_host }}
+          - name: REDIS_PORT
+            value: {{ .Values.redis_port | quote }}
+          - name: REDIS_PASSWORD
+            value: {{ .Values.redis_password | quote }}
+          - name: ALGO_ENABLED_BY_DEFAULT
+            value: {{ .Values.algo_enabled_by_default | quote }}
+          - name: USAGE_MIN_USAGE
+            value: {{ .Values.usage_min_usage | quote }}
+          - name: USAGE_AGE_MIN_CHECK
+            value: {{ .Values.usage_age_min_check | quote }}
+          - name: USAGE_FLOOR_VALUE
+            value: {{ .Values.usage_floor_value | quote }}
+          - name: USAGE_CEILING_VALUE
+            value: {{ .Values.usage_ceiling_value | quote }}
+          - name: USAGE_MIN_FACTOR
+            value: {{ .Values.usage_min_factor | quote }}
+          - name: USAGE_MAX_FACTOR
+            value: {{ .Values.usage_max_factor | quote }}
+          - name: USAGE_FACTOR_STRATEGY
+            value: {{ .Values.usage_factor_strategy | quote }}
+          - name: MODEL_GROUP
+            value: {{ .Values.model_group | quote }}
+          - name: ML4R_GC_BUCKET_NAME
+            value: {{ .Values.ml4r_bucket | quote }}
+          - name: ML4R_COUNTRIES
+            value: {{ .Values.ml4r_countries | quote }}
+          - name: SERVICE_NAME
+            value: {{ .Values.service_name | quote }}
+          - name: AUTH0_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: secrets
+                key: auth0_client_id
+          - name: AUTH0_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: secrets
+                key: auth0_client_secret
+          - name: ALGOLIA_ID
+            valueFrom:
+              secretKeyRef:
+                name: platform-valuation-algolia-api-key
+                key: id
+          - name: ALGOLIA_KEY
+            valueFrom:
+              secretKeyRef:
+                name: platform-valuation-algolia-api-key
+                key: api_key
+      - rouseservices.com/branch: {{.Values.environment_name}}
+      - rouseservices.com/github-repo-url: github.com-RouseServices-platform-valuation-service
+      - rouseservices.com/project-name: platform-valuation-service
+      - rouseservices.com/env: {{.Values.environment_name}}
